@@ -1,0 +1,595 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+export const Route = createFileRoute("/")({
+  component: Injector,
+});
+
+type AdSlot = { id: string; label: string; code: string };
+
+const STORAGE_KEY = "ad-injector-state-v1";
+
+const DEFAULT_HTML = `<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <title>My Site</title>
+  <!-- Monetag SDK / Head Ad -->
+  {{AD1}}
+</head>
+<body>
+  <h1>স্বাগতম</h1>
+
+  <!-- ব্যানার অ্যাড -->
+  {{AD2}}
+
+  <p>এখানে আপনার কনটেন্ট থাকবে।</p>
+
+  {{AD3}}
+</body>
+</html>`;
+
+function makeSlot(i: number): AdSlot {
+  return { id: `AD${i}`, label: `Monetag Ad Code #${i}`, code: "" };
+}
+
+function loadState(): { html: string; slots: AdSlot[] } | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+// Matches Monetag SDK script tags like:
+// <script src='//libtl.com/sdk.js' data-zone='...' data-sdk='...'></script>
+const SDK_REGEX = /<script\b[^>]*\bsrc\s*=\s*['"][^'"]*libtl\.com\/sdk\.js[^'"]*['"][^>]*>\s*<\/script>/gi;
+const ZONE_REGEX = /data-zone\s*=\s*['"]([^'"]+)['"]/i;
+const ZONE_REGEX_G = /data-zone\s*=\s*['"]([^'"]+)['"]/gi;
+const SDK_ATTR_REGEX = /data-sdk\s*=\s*['"]([^'"]+)['"]/i;
+// Matches `const adZones = [ ...anything... ]` (also `let`/`var`, single/double/back-tick strings inside).
+const AD_ZONES_REGEX = /\b(const|let|var)\s+adZones\s*=\s*\[[\s\S]*?\]/g;
+
+function detectSdkTags(html: string): { tag: string; zone: string; sdk: string }[] {
+  const matches = html.match(SDK_REGEX) || [];
+  return matches.map((tag) => {
+    const z = tag.match(ZONE_REGEX);
+    const s = tag.match(SDK_ATTR_REGEX);
+    return { tag, zone: z ? z[1] : "unknown", sdk: s ? s[1] : "" };
+  });
+}
+
+function extractZonesFromCode(code: string): string[] {
+  const out: string[] = [];
+  const rx = new RegExp(ZONE_REGEX_G.source, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(code)) !== null) out.push(m[1]);
+  return out;
+}
+
+function extractSdksFromCode(code: string): string[] {
+  const out: string[] = [];
+  const rx = /data-sdk\s*=\s*['"]([^'"]+)['"]/gi;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(code)) !== null) out.push(m[1]);
+  return out;
+}
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildOutput(html: string, slots: AdSlot[], zoneMode: "single" | "double" = "single") {
+  // 0) Build mapping: original show_XXX identifier → new show_XXX identifier,
+  //    from the ordered pairing of detected SDK tags in HTML with slot codes.
+  const originalSdks = detectSdkTags(html);
+  const sdkNameMap: Array<[string, string]> = [];
+  originalSdks.forEach((orig, i) => {
+    const slot = slots[i];
+    if (!slot || !orig.sdk) return;
+    const news = extractSdksFromCode(slot.code || "");
+    const newName = news[0];
+    if (newName && newName !== orig.sdk) sdkNameMap.push([orig.sdk, newName]);
+  });
+
+  // 1) Replace {{ADx}} placeholders
+  let out = html;
+  for (const s of slots) {
+    const p = new RegExp(`\\{\\{\\s*${s.id}\\s*\\}\\}`, "g");
+    out = out.replace(p, s.code || "");
+  }
+  // 2) Replace Monetag SDK <script> tags in order with slot codes
+  let idx = 0;
+  out = out.replace(SDK_REGEX, (original) => {
+    const s = slots[idx++];
+    if (!s) return original;
+    const code = (s.code || "").trim();
+    return code || original;
+  });
+  // 3) Rewrite every `show_OLD` identifier in the surrounding HTML/JS to the
+  //    matching `show_NEW` from the paired slot. Handles patterns like:
+  //      if (typeof show_10879736 === "function") { show_10879736(); }
+  //    where the same identifier appears multiple times per SDK.
+  for (const [oldName, newName] of sdkNameMap) {
+    const rx = new RegExp(`\\b${escapeRegex(oldName)}\\b`, "g");
+    out = out.replace(rx, newName);
+  }
+  // 4) Rewrite `const adZones = [...]` with zone IDs collected from slot codes.
+  //    Single mode: each zone once. Double mode: each zone twice in a row.
+  const baseZones: string[] = [];
+  for (const s of slots) {
+    const z = extractZonesFromCode(s.code || "");
+    baseZones.push(...z);
+  }
+  const zones =
+    zoneMode === "double" ? baseZones.flatMap((z) => [z, z]) : baseZones;
+  if (zones.length > 0) {
+    out = out.replace(AD_ZONES_REGEX, (_full, kw) => {
+      const list = zones.map((z) => `'${z}'`).join(", ");
+      return `${kw} adZones = [${list}]`;
+    });
+  }
+  return out;
+}
+
+function countSdkTags(html: string) {
+  const m = html.match(SDK_REGEX);
+  return m ? m.length : 0;
+}
+
+type LogLine = { text: string; tone: "info" | "ok" | "warn" };
+
+function Injector() {
+  const [html, setHtml] = useState(DEFAULT_HTML);
+  const [slots, setSlots] = useState<AdSlot[]>([
+    makeSlot(1), makeSlot(2), makeSlot(3), makeSlot(4), makeSlot(5),
+  ]);
+  const [copied, setCopied] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  const [zoneMode, setZoneMode] = useState<"single" | "double">("single");
+
+  // Build pipeline state
+  const [output, setOutput] = useState<string>("");
+  const [building, setBuilding] = useState(false);
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [progress, setProgress] = useState(0);
+  const logRef = useRef<HTMLDivElement>(null);
+  const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  useEffect(() => {
+    const s = loadState();
+    if (s) { setHtml(s.html); setSlots(s.slots); }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ html, slots }));
+  }, [html, slots, hydrated]);
+
+  useEffect(() => {
+    // Auto-scroll log
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [logs]);
+
+  useEffect(() => () => { timers.current.forEach(clearTimeout); }, []);
+
+  const detectedSdks = useMemo(() => detectSdkTags(html), [html]);
+  const sdkCount = detectedSdks.length;
+
+  // Auto-sync slot count to detected SDK tag count (exact match)
+  useEffect(() => {
+    if (!hydrated) return;
+    if (sdkCount === 0) return; // keep existing slots if HTML has no SDK yet
+    if (sdkCount === slots.length) return;
+    const next = [...slots];
+    if (sdkCount > slots.length) {
+      for (let i = slots.length + 1; i <= sdkCount; i++) next.push(makeSlot(i));
+    } else {
+      next.length = sdkCount;
+    }
+    setSlots(next);
+  }, [sdkCount, hydrated]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const usedCount = useMemo(
+    () =>
+      slots.filter(
+        (s, i) =>
+          new RegExp(`\\{\\{\\s*${s.id}\\s*\\}\\}`).test(html) || i < sdkCount
+      ).length,
+    [html, slots, sdkCount]
+  );
+
+  const setSlotCount = (n: number) => {
+    const next = [...slots];
+    if (n > slots.length) for (let i = slots.length + 1; i <= n; i++) next.push(makeSlot(i));
+    else next.length = n;
+    setSlots(next);
+  };
+
+  const updateSlot = (idx: number, code: string) => {
+    const next = [...slots];
+    next[idx] = { ...next[idx], code };
+    setSlots(next);
+  };
+
+  const insertToken = (id: string) => setHtml((prev) => prev + `\n{{${id}}}`);
+
+  const generate = () => {
+    timers.current.forEach(clearTimeout);
+    timers.current = [];
+    setBuilding(true);
+    setOutput("");
+    setLogs([]);
+    setProgress(0);
+
+    const steps: LogLine[] = [];
+    steps.push({ text: "▸ Initializing build pipeline...", tone: "info" });
+    steps.push({ text: `▸ Parsing HTML source (${html.length} chars)`, tone: "info" });
+    steps.push({ text: "▸ Scanning for {{ADx}} placeholders...", tone: "info" });
+
+    const found = slots.filter((s) =>
+      new RegExp(`\\{\\{\\s*${s.id}\\s*\\}\\}`).test(html)
+    );
+    steps.push({ text: `✓ Found ${found.length} placeholder(s)`, tone: "ok" });
+
+    steps.push({ text: "▸ Detecting Monetag SDK <script> tags...", tone: "info" });
+    const sdkFound = countSdkTags(html);
+    steps.push({
+      text: `✓ Detected ${sdkFound} Monetag SDK tag(s) — will be replaced in order`,
+      tone: "ok",
+    });
+
+    slots.forEach((s, i) => {
+      const inHtml = new RegExp(`\\{\\{\\s*${s.id}\\s*\\}\\}`).test(html);
+      const targetsSdk = i < sdkFound;
+      if (!inHtml && !targetsSdk) return;
+      if (!s.code.trim()) {
+        steps.push({ text: `⚠ Slot #${i + 1} → empty (target removed)`, tone: "warn" });
+        return;
+      }
+      const preview = s.code.replace(/\s+/g, " ").slice(0, 44);
+      const where = inHtml ? `{{${s.id}}}` : `SDK tag #${i + 1}`;
+      steps.push({
+        text: `▸ Injecting → ${where}  ⟵  "${preview}${s.code.length > 44 ? "…" : ""}"`,
+        tone: "info",
+      });
+      steps.push({ text: `✓ ${where} replaced (${s.code.length} chars)`, tone: "ok" });
+    });
+
+    steps.push({ text: "▸ Preserving surrounding HTML (no other changes)...", tone: "info" });
+    steps.push({ text: "✓ Structure valid — assembling final HTML", tone: "ok" });
+    steps.push({ text: "✓ Build complete 🚀", tone: "ok" });
+
+    const perStep = 160;
+    steps.forEach((line, i) => {
+      const t = setTimeout(() => {
+        setLogs((prev) => [...prev, line]);
+        setProgress(Math.round(((i + 1) / steps.length) * 100));
+      }, i * perStep);
+      timers.current.push(t);
+    });
+
+    const done = setTimeout(() => {
+      setOutput(buildOutput(html, slots, zoneMode));
+      setBuilding(false);
+    }, steps.length * perStep + 200);
+    timers.current.push(done);
+  };
+
+  const copyOutput = async () => {
+    if (!output) return;
+    await navigator.clipboard.writeText(output);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1600);
+  };
+
+  const download = () => {
+    if (!output) return;
+    const blob = new Blob([output], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "index.html";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const reset = () => {
+    if (!confirm("সব ডেটা মুছে দেওয়া হবে, নিশ্চিত?")) return;
+    setHtml(DEFAULT_HTML);
+    setSlots([makeSlot(1), makeSlot(2), makeSlot(3), makeSlot(4), makeSlot(5)]);
+    setOutput("");
+    setLogs([]);
+    setProgress(0);
+  };
+
+  return (
+    <div className="min-h-screen">
+      <header className="border-b border-border/60 backdrop-blur-xl bg-background/50 sticky top-0 z-20">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-brand shadow-glow flex items-center justify-center font-bold text-primary-foreground">A</div>
+            <div>
+              <h1 className="text-lg sm:text-xl font-bold leading-tight">
+                <span className="text-gradient">Ad Code Injector</span>
+              </h1>
+              <p className="text-xs text-muted-foreground">
+                HTML এ Monetag SDK ডায়নামিকভাবে বসান · by{" "}
+                <span className="text-primary font-semibold">MSR Tech Official</span>
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="hidden sm:flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="w-2 h-2 rounded-full bg-success animate-pulse" />
+              Auto-saved
+            </div>
+            <a
+              href="https://t.me/msrtechofficial"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Join our Telegram — MSR Tech Official"
+              className="group inline-flex items-center gap-2 pl-1.5 pr-3 py-1.5 rounded-full bg-[#229ED9]/15 hover:bg-[#229ED9]/25 border border-[#229ED9]/40 text-[#229ED9] text-xs font-semibold transition-colors"
+            >
+              <img
+                src="https://telegram.org/img/t_logo.png"
+                alt="Telegram"
+                width={20}
+                height={20}
+                className="w-5 h-5 rounded-full"
+                loading="lazy"
+              />
+              <span className="hidden sm:inline">MSR Tech Official</span>
+              <span className="sm:hidden">Telegram</span>
+            </a>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 grid gap-6 lg:grid-cols-2">
+        {/* HTML editor */}
+        <section className="rounded-2xl bg-gradient-surface border border-border/60 shadow-card overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-border/60">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2 h-2 rounded-full bg-primary" />
+              <h2 className="font-semibold text-sm">HTML সোর্স</h2>
+              <span className="text-[11px] text-muted-foreground truncate">
+                placeholders: <code className="text-accent">{`{{AD1}}`}</code>, <code className="text-accent">{`{{AD2}}`}</code> …
+              </span>
+            </div>
+            <button onClick={reset} className="text-xs px-3 py-1.5 rounded-lg bg-muted hover:bg-destructive/20 hover:text-destructive transition-colors">
+              Reset
+            </button>
+          </div>
+          <textarea
+            value={html}
+            onChange={(e) => setHtml(e.target.value)}
+            spellCheck={false}
+            className="w-full h-[340px] bg-transparent px-5 py-4 font-mono text-[13px] leading-relaxed outline-none resize-none placeholder:text-muted-foreground/50"
+            placeholder="এখানে HTML কোড পেস্ট করুন..."
+          />
+          <div className="px-5 py-3 border-t border-border/60 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground mr-2">দ্রুত যোগ:</span>
+            {slots.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => insertToken(s.id)}
+                className="text-[11px] px-2.5 py-1 rounded-md bg-muted hover:bg-primary/20 hover:text-primary font-mono transition-colors"
+              >{`{{${s.id}}}`}</button>
+            ))}
+          </div>
+        </section>
+
+        {/* Ad slots */}
+        <section className="rounded-2xl bg-gradient-surface border border-border/60 shadow-card overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-border/60 gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-accent" />
+              <h2 className="font-semibold text-sm">Monetag Ad Codes</h2>
+              <span className="text-[11px] text-muted-foreground">{usedCount}/{slots.length} ব্যবহৃত · SDK detected: <span className="text-accent font-semibold">{sdkCount}</span></span>
+            </div>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/15 text-primary font-semibold">
+              auto-synced
+            </span>
+          </div>
+          <div className="max-h-[380px] overflow-y-auto divide-y divide-border/60">
+            {slots.map((s, i) => {
+              const inHtml = new RegExp(`\\{\\{\\s*${s.id}\\s*\\}\\}`).test(html);
+              const target = detectedSdks[i];
+              const used = inHtml || !!target;
+              return (
+                <div key={s.id} className="px-5 py-4">
+                  <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-xs px-2 py-0.5 rounded-md bg-primary/15 text-primary">{`{{${s.id}}}`}</span>
+                      {target && (
+                        <span className="font-mono text-[10px] px-2 py-0.5 rounded-md bg-accent/15 text-accent">
+                          SDK #{i + 1} · zone {target.zone}
+                        </span>
+                      )}
+                      <span className="text-xs text-muted-foreground">{s.label}</span>
+                    </div>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${used ? "bg-success/15 text-success" : "bg-muted text-muted-foreground"}`}>
+                      {used ? "linked" : "unused"}
+                    </span>
+                  </div>
+                  {target && (
+                    <div className="mb-2 text-[10.5px] font-mono text-muted-foreground bg-background/40 border border-border/50 rounded-md px-2 py-1 truncate">
+                      target → <span className="text-foreground/80">{target.tag}</span>
+                    </div>
+                  )}
+                  <textarea
+                    value={s.code}
+                    onChange={(e) => updateSlot(i, e.target.value)}
+                    spellCheck={false}
+                    placeholder={target
+                      ? `এই SDK এর পরিবর্তে নতুন <script ... data-zone='...'></script> দিন`
+                      : `Monetag অ্যাড কোড #${i + 1} এখানে পেস্ট করুন...`}
+                    className="w-full h-24 bg-input/60 border border-border rounded-lg px-3 py-2 font-mono text-[12px] outline-none focus:ring-2 focus:ring-ring resize-none placeholder:text-muted-foreground/50"
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* Execute bar */}
+        <section className="lg:col-span-2 rounded-2xl bg-gradient-surface border border-border/60 shadow-card overflow-hidden">
+          <div className="p-5 flex flex-col sm:flex-row sm:items-center gap-4">
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold">Build & Inject</h3>
+              <p className="text-xs text-muted-foreground">
+                adZones মোড বেছে নিন — Single: প্রতি zone একবার · Double: প্রতি zone পরপর দুইবার।
+              </p>
+            </div>
+            <div className="inline-flex rounded-xl border border-border/60 bg-muted/40 p-1 text-xs font-semibold">
+              <button
+                type="button"
+                onClick={() => setZoneMode("single")}
+                className={`px-3 py-1.5 rounded-lg transition-colors ${
+                  zoneMode === "single"
+                    ? "bg-gradient-brand text-primary-foreground shadow-glow"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Single Code
+              </button>
+              <button
+                type="button"
+                onClick={() => setZoneMode("double")}
+                className={`px-3 py-1.5 rounded-lg transition-colors ${
+                  zoneMode === "double"
+                    ? "bg-gradient-brand text-primary-foreground shadow-glow"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Double Code
+              </button>
+            </div>
+            <button
+              onClick={generate}
+              disabled={building}
+              className="group relative overflow-hidden px-6 py-3 rounded-xl bg-gradient-brand text-primary-foreground font-semibold shadow-glow disabled:opacity-70 disabled:cursor-not-allowed hover:opacity-95 transition-opacity"
+            >
+              <span className="relative z-10 flex items-center gap-2">
+                {building ? (
+                  <>
+                    <span className="w-4 h-4 rounded-full border-2 border-primary-foreground/40 border-t-primary-foreground animate-spin" />
+                    Building...
+                  </>
+                ) : (
+                  <>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                    Execute Build
+                  </>
+                )}
+              </span>
+            </button>
+          </div>
+          {(building || logs.length > 0) && (
+            <div className="border-t border-border/60">
+              <div className="h-1 bg-muted overflow-hidden">
+                <div
+                  className="h-full bg-gradient-brand transition-all duration-300"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+              <div ref={logRef} className="max-h-56 overflow-y-auto px-5 py-4 font-mono text-[12px] leading-relaxed bg-background/40 space-y-1">
+                {logs.map((l, i) => (
+                  <div
+                    key={i}
+                    className={
+                      l.tone === "ok" ? "text-success" :
+                      l.tone === "warn" ? "text-accent" : "text-muted-foreground"
+                    }
+                    style={{ animation: "fadeUp .25s ease-out" }}
+                  >
+                    <span className="text-muted-foreground/60 mr-2">[{String(i + 1).padStart(2, "0")}]</span>{l.text}
+                  </div>
+                ))}
+                {building && (
+                  <div className="text-primary">
+                    <span className="inline-block w-2 h-4 align-middle bg-primary animate-pulse" /> compiling…
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* Output */}
+        <section className="lg:col-span-2 rounded-2xl bg-gradient-surface border border-border/60 shadow-card overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-border/60 flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${output ? "bg-success" : "bg-muted-foreground/40"}`} />
+              <h2 className="font-semibold text-sm">সম্পূর্ণ কোড (Output)</h2>
+              <span className="text-[11px] text-muted-foreground">
+                {output ? `${output.length.toLocaleString()} chars` : "Execute চাপুন"}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={copyOutput}
+                disabled={!output}
+                className="text-xs px-3 py-1.5 rounded-lg bg-gradient-brand text-primary-foreground font-semibold hover:opacity-90 transition-opacity shadow-glow disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {copied ? "✓ Copied" : "Copy Code"}
+              </button>
+              <button
+                onClick={download}
+                disabled={!output}
+                className="text-xs px-3 py-1.5 rounded-lg bg-muted hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Download .html
+              </button>
+            </div>
+          </div>
+          {output ? (
+            <pre className="max-h-[500px] overflow-auto px-5 py-4 font-mono text-[12.5px] leading-relaxed whitespace-pre-wrap break-words">
+              {output}
+            </pre>
+          ) : (
+            <div className="px-5 py-16 text-center text-sm text-muted-foreground">
+              এখনও কোনো output নেই — উপরে <span className="text-primary font-semibold">Execute Build</span> চাপুন।
+            </div>
+          )}
+        </section>
+      </main>
+
+      <footer className="max-w-7xl mx-auto px-6 py-8 text-center text-xs text-muted-foreground space-y-2">
+        <p>সব পরিবর্তন আপনার ব্রাউজারে অটো সেভ হয় — refresh করলেও থাকবে।</p>
+        <p className="flex items-center justify-center gap-2 flex-wrap">
+          <span>Developed by</span>
+          <a
+            href="https://t.me/msrtechofficial"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-primary font-semibold hover:underline"
+          >
+            <img
+              src="https://telegram.org/img/t_logo.png"
+              alt="Telegram"
+              width={14}
+              height={14}
+              className="w-3.5 h-3.5 rounded-full"
+              loading="lazy"
+            />
+            MSR Tech Official
+          </a>
+          <span className="text-muted-foreground/60">· @msrtechofficial</span>
+        </p>
+      </footer>
+
+      <style>{`
+        @keyframes fadeUp {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
+    </div>
+  );
+}
